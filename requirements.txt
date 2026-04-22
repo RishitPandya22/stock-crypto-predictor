@@ -6,5 +6,4 @@ seaborn
 plotly
 yfinance
 scikit-learn
-tensorflow-cpu
 requests

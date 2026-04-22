@@ -1,18 +1,11 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import os
 import warnings
 warnings.filterwarnings('ignore')
 
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
 
 # ================================
 # SYMBOLS
@@ -50,132 +43,107 @@ def fetch_data(symbol, period="2y"):
     return df
 
 # ================================
-# PREPARE DATA FOR LSTM
+# CREATE FEATURES FOR ML
 # ================================
-def prepare_data(df, lookback=60):
-    """
-    lookback = how many past days the LSTM looks at
-    to predict the next day
-    """
-    close_prices = df['Close'].values.reshape(-1, 1)
+def create_features(df):
+    df = df.copy()
 
-    # Scale prices to 0-1 range (LSTM works better this way)
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(close_prices)
+    # Lag features — past prices as inputs
+    for lag in [1, 2, 3, 5, 10, 20]:
+        df[f'lag_{lag}'] = df['Close'].shift(lag)
 
-    X, y = [], []
-    for i in range(lookback, len(scaled)):
-        X.append(scaled[i-lookback:i, 0])  # last 60 days
-        y.append(scaled[i, 0])             # next day price
+    # Rolling stats
+    df['rolling_mean_5']  = df['Close'].rolling(5).mean()
+    df['rolling_mean_20'] = df['Close'].rolling(20).mean()
+    df['rolling_std_5']   = df['Close'].rolling(5).std()
+    df['rolling_std_20']  = df['Close'].rolling(20).std()
 
-    X, y = np.array(X), np.array(y)
+    # Price momentum
+    df['momentum_5']  = df['Close'] / df['Close'].shift(5) - 1
+    df['momentum_20'] = df['Close'] / df['Close'].shift(20) - 1
 
-    # Reshape for LSTM: (samples, timesteps, features)
-    X = X.reshape(X.shape[0], X.shape[1], 1)
+    # Volume momentum
+    df['vol_momentum'] = df['Volume'] / df['Volume'].rolling(10).mean()
 
-    # 80% train, 20% test
-    split = int(len(X) * 0.8)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
+    # High-Low range
+    df['hl_range'] = (df['High'] - df['Low']) / df['Close']
 
-    return X_train, X_test, y_train, y_test, scaler, close_prices
-
-# ================================
-# BUILD LSTM MODEL
-# ================================
-def build_model(lookback=60):
-    model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=(lookback, 1)),
-        Dropout(0.2),
-        LSTM(64, return_sequences=False),
-        Dropout(0.2),
-        Dense(32, activation='relu'),
-        Dense(1)
-    ])
-    model.compile(optimizer='adam', loss='mse')
-    return model
+    df = df.dropna()
+    return df
 
 # ================================
 # TRAIN MODEL
 # ================================
 def train_model(symbol, period="2y"):
-    print(f"\n🔄 Fetching data for {symbol}...")
+    print(f"Fetching data for {symbol}...")
     df = fetch_data(symbol, period)
     if df is None:
-        print("❌ No data found!")
         return None, None, None, None
 
     print(f"✅ Got {len(df)} days of data")
-    print("🧠 Preparing data for LSTM...")
+    df_feat = create_features(df)
 
-    X_train, X_test, y_train, y_test, scaler, close_prices = prepare_data(df)
+    feature_cols = [c for c in df_feat.columns if c != 'Close'
+                    and c not in ['Open','High','Low','Volume']]
 
-    print(f"📊 Training samples: {len(X_train)}, Test samples: {len(X_test)}")
-    print("🚀 Training LSTM model (this takes 1-2 mins)...")
+    X = df_feat[feature_cols].values
+    y = df_feat['Close'].values
 
-    model = build_model()
+    # Scale
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y.reshape(-1,1)).ravel()
 
-    early_stop = EarlyStopping(
-        monitor='val_loss',
-        patience=5,
-        restore_best_weights=True
+    # Train/test split
+    split = int(len(X_scaled) * 0.8)
+    X_train = X_scaled[:split]
+    y_train = y_scaled[:split]
+
+    print("🚀 Training Gradient Boosting model...")
+    model = GradientBoostingRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=4,
+        random_state=42
     )
+    model.fit(X_train, y_train)
+    print("✅ Model trained!")
 
-    history = model.fit(
-        X_train, y_train,
-        epochs=50,
-        batch_size=32,
-        validation_split=0.1,
-        callbacks=[early_stop],
-        verbose=1
-    )
-
-    # Evaluate
-    y_pred = model.predict(X_test, verbose=0)
-    y_pred_actual = scaler.inverse_transform(y_pred)
-    y_test_actual = scaler.inverse_transform(y_test.reshape(-1, 1))
-
-    mae = mean_absolute_error(y_test_actual, y_pred_actual)
-    rmse = np.sqrt(mean_squared_error(y_test_actual, y_pred_actual))
-
-    print(f"\n📈 Model Performance:")
-    print(f"   MAE  (avg error): ${mae:.2f}")
-    print(f"   RMSE            : ${rmse:.2f}")
-
-    return model, scaler, df, history
+    return model, (scaler_X, scaler_y), df, feature_cols
 
 # ================================
 # PREDICT NEXT 7 DAYS
 # ================================
-def predict_future(model, scaler, df, days=7):
-    close_prices = df['Close'].values.reshape(-1, 1)
-    scaled = scaler.transform(close_prices)
+def predict_future(model, scalers, df, feature_cols, days=7):
+    scaler_X, scaler_y = scalers
 
-    # Use last 60 days as input
-    last_60 = scaled[-60:]
+    df_feat = create_features(df)
+    last_row = df_feat[feature_cols].iloc[-1].values
+
     predictions = []
+    current_features = last_row.copy()
+    current_price = df['Close'].iloc[-1]
 
-    current_input = last_60.copy()
+    for i in range(days):
+        X_input = scaler_X.transform(current_features.reshape(1, -1))
+        pred_scaled = model.predict(X_input)[0]
+        pred_price = scaler_y.inverse_transform([[pred_scaled]])[0][0]
 
-    for _ in range(days):
-        X_input = current_input[-60:].reshape(1, 60, 1)
-        pred_scaled = model.predict(X_input, verbose=0)
-        pred_price = scaler.inverse_transform(pred_scaled)[0][0]
+        # Add small random walk for realism
+        noise = np.random.normal(0, current_price * 0.005)
+        pred_price = pred_price + noise
         predictions.append(pred_price)
 
-        # Add prediction to input for next step
-        current_input = np.append(
-            current_input,
-            pred_scaled,
-            axis=0
-        )
+        # Update lag features for next prediction
+        current_features[0] = pred_price  # lag_1
+        current_price = pred_price
 
-    # Create future dates
     last_date = df.index[-1]
     future_dates = pd.date_range(
         start=last_date + pd.Timedelta(days=1),
         periods=days,
-        freq='B'  # Business days only
+        freq='B'
     )
 
     future_df = pd.DataFrame({
@@ -186,15 +154,12 @@ def predict_future(model, scaler, df, days=7):
     return future_df
 
 # ================================
-# TEST IT
+# TEST
 # ================================
 if __name__ == "__main__":
-    # Train on Apple stock
-    model, scaler, df, history = train_model("AAPL", period="2y")
-
-    if model is not None:
-        print("\n🔮 Predicting next 7 days...")
-        future = predict_future(model, scaler, df, days=7)
-        print("\n📅 Next 7 Day Price Predictions for AAPL:")
-        print(future.to_string())
-        print("\n🎉 Stage 2 Complete!")
+    model, scalers, df, feature_cols = train_model("AAPL")
+    if model:
+        future = predict_future(model, scalers, df, feature_cols)
+        print("\n📅 Next 7 Day Predictions:")
+        print(future)
+        print("\n🎉 Done!")

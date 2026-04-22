@@ -10,7 +10,7 @@ warnings.filterwarnings('ignore')
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-from predictor import fetch_data, train_model, predict_future, ALL_SYMBOLS, STOCKS, CRYPTO
+from predictor import fetch_data, train_model, predict_future, predict_future, ALL_SYMBOLS, STOCKS, CRYPTO
 from signals import generate_signal
 
 # ================================
@@ -571,10 +571,10 @@ if run_btn:
             signal_result = generate_signal(df)
 
         with st.spinner("🧠 Training LSTM..."):
-            model, scaler, df_full, history = train_model(selected_symbol, period=period)
+            model, scalers, df_full, feature_cols = train_model(selected_symbol, period=period)
 
         with st.spinner("🔮 Generating forecast..."):
-            future_df = predict_future(model, scaler, df_full, days=7)
+            future_df = predict_future(model, scalers, df_full, feature_cols, days=7)
 
         with st.spinner("📰 Analysing news sentiment..."):
             news_items, overall_sentiment = get_news_sentiment(
